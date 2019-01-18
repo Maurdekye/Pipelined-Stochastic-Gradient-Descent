@@ -1,12 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <pthread.h>
 
 #define TRAIN_IMAGES_FILE "train-images-idx3-ubyte"
 #define TRAIN_LABELS_FILE "train-labels-idx1-ubyte"
 #define MNIST_DIM 28
 
-#define INPUT_SIZE 784
+#define INPUT_SIZE 784 // MNIST_DIM * MNIST_DIM
 #define HIDDEN_SIZE 100
 #define OUTPUT_SIZE 10
 
@@ -14,6 +15,8 @@
 #define NORMALIZE_FACTOR 100
 #define BATCH_ITERS 8
 #define BATCH_SIZE 128
+
+#define MULTITHREADING
 #define NTHREADS 16
 
 typedef struct {
@@ -101,7 +104,7 @@ double sign(double x)
   return 0.0;
 }
 
-double* evaluate(neural_network* network, double* inputs)
+double* evaluate(neural_network* network, double* inputs, int tweak_layer, int tweak_id, double tweak_amt)
 {
   // Apply input layer biases
   double input_layer[INPUT_SIZE]; 
@@ -119,7 +122,10 @@ double* evaluate(neural_network* network, double* inputs)
     double node_sum = 0;
     for (int i = 0; i < INPUT_SIZE; i++)
     {
-      node_sum += input_layer[i] * network->input_to_hidden_weights[i][h];
+      if (tweak_layer == 0 && tweak_id == (h * INPUT_SIZE + i)) 
+        node_sum += input_layer[i] * (network->input_to_hidden_weights[i][h] + tweak_amt);
+      else
+        node_sum += input_layer[i] * network->input_to_hidden_weights[i][h];
     }
     node_sum += network->hidden_biases[h];
     hidden_layer[h] = sigmoid(node_sum);
@@ -133,7 +139,10 @@ double* evaluate(neural_network* network, double* inputs)
     double node_sum = 0;
     for (int h = 0; h < HIDDEN_SIZE; h++)
     {
-      node_sum += hidden_layer[h] * network->hidden_to_output_weights[h][o];
+      if (tweak_layer == 1 && tweak_id == (o * HIDDEN_SIZE + h)) 
+        node_sum += hidden_layer[h] * (network->hidden_to_output_weights[h][o] + tweak_amt);
+      else
+        node_sum += hidden_layer[h] * network->hidden_to_output_weights[h][o];
     }
     node_sum += network->output_biases[o];
     output_layer[o] = sigmoid(node_sum);
@@ -144,7 +153,7 @@ double* evaluate(neural_network* network, double* inputs)
 
 double error(neural_network* network, double* inputs, double* ground_truth)
 {
-  double* output = evaluate(network, inputs);
+  double* output = evaluate(network, inputs, -1, 0, 0);
   double sqr_sum = 0;
   for (int o = 0; o < OUTPUT_SIZE; o++)
   {
@@ -153,6 +162,74 @@ double error(neural_network* network, double* inputs, double* ground_truth)
   }
   free(output);
   return sqr_sum;
+}
+
+double error_with_tweak(neural_network* network, double* inputs, double* ground_truth, int tweak_layer, int tweak_id, double tweak_amt)
+{
+  double* output = evaluate(network, inputs, tweak_layer, tweak_id, tweak_amt);
+  double sqr_sum = 0;
+  for (int o = 0; o < OUTPUT_SIZE; o++)
+  {
+    double err = output[o] - ground_truth[o];
+    sqr_sum += err*err;
+  }
+  free(output);
+  return sqr_sum;
+}
+
+typedef struct {
+  int id;
+  double base_err;
+  double step_distance;
+  neural_network* network;
+  neural_network* new_network;
+  neural_network* gradient;
+  double (*train_batch_inputs)[BATCH_SIZE][INPUT_SIZE];
+  double (*train_batch_outputs)[BATCH_SIZE][OUTPUT_SIZE];
+} thread_local_data;
+
+void* train_itoh_thread(void* varargp)
+{
+  thread_local_data* data = (thread_local_data*) varargp;
+
+  int range = INPUT_SIZE / NTHREADS;
+  for (int i = range * data->id; i < range * (data->id + 1); i++)
+  {
+    for (int h = 0; h < HIDDEN_SIZE; h++)
+    {
+      double step = data->gradient->input_to_hidden_weights[i][h] * STEP_SIZE;
+      data->step_distance += step*step;
+      data->new_network->input_to_hidden_weights[i][h] + step;
+
+      double new_err = 0;
+      for (int k = 0; k < BATCH_SIZE; k++)
+        new_err += error_with_tweak(data->network, *data->train_batch_inputs[k], *data->train_batch_outputs[k], 0, h * INPUT_SIZE + i, step);
+
+      data->gradient->input_to_hidden_weights[i][h] = sign(data->gradient->input_to_hidden_weights[i][h]) * (data->base_err - new_err);
+    }
+  }
+}
+
+void* train_htoo_thread(void* varargp)
+{
+  thread_local_data* data = (thread_local_data*) varargp;
+
+  int range = HIDDEN_SIZE / NTHREADS;
+  for (int h = range * data->id; h < range * (data->id + 1); h++)
+  {
+    for (int o = 0; o < OUTPUT_SIZE; o++)
+    {
+      double step = data->gradient->hidden_to_output_weights[h][o] * STEP_SIZE;
+      data->step_distance += step*step;
+      data->new_network->hidden_to_output_weights[h][o] + step;
+
+      double new_err = 0;
+      for (int k = 0; k < BATCH_SIZE; k++)
+        new_err += error_with_tweak(data->network, *data->train_batch_inputs[k], *data->train_batch_outputs[k], 1, o * HIDDEN_SIZE + h, step);
+
+      data->gradient->hidden_to_output_weights[h][o] = sign(data->gradient->hidden_to_output_weights[h][o]) * (data->base_err - new_err);
+    }
+  }
 }
 
 int main(int argc, char** argv)
@@ -259,9 +336,10 @@ int main(int argc, char** argv)
     
     printf("Training Epoch #%d\n", epoch+1);
 
-    for (int j = 0; j < BATCH_ITERS; j++)
+    for (int batch = 0; batch < BATCH_ITERS; batch++)
     {
-      printf("Training iteration %d/%d\n", j+1, BATCH_ITERS);
+      
+      printf("Training iteration %d/%d\n", batch+1, BATCH_ITERS);
 
       neural_network new_network;
       double total_step_distance = 0;
@@ -269,6 +347,21 @@ int main(int argc, char** argv)
       double base_err = 0;
       for (int k = 0; k < BATCH_SIZE; k++)
         base_err += error(network, train_batch_inputs[k], train_batch_outputs[k]);
+      
+      thread_local_data thread_data[NTHREADS];
+      pthread_t thread_ids[NTHREADS];
+
+      for (int t = 0; t < NTHREADS; t++)
+      {
+        thread_data[t].id = t;
+        thread_data[t].base_err = base_err;
+        thread_data[t].step_distance = 0;
+        thread_data[t].network = network;
+        thread_data[t].new_network = &new_network;
+        thread_data[t].gradient = gradient;
+        thread_data[t].train_batch_inputs = &train_batch_inputs;
+        thread_data[t].train_batch_outputs = &train_batch_outputs;
+      }
 
       // compute gradient for input biases
       for (int i = 0; i < INPUT_SIZE; i++)
@@ -288,39 +381,71 @@ int main(int argc, char** argv)
       }
 
       // compute gradient for hidden biases
-      for (int h = 0; h < HIDDEN_SIZE; h++)
+        for (int h = 0; h < HIDDEN_SIZE; h++)
+        {
+          double orig_value = network->hidden_biases[h]; 
+          double step = gradient->hidden_biases[h] * STEP_SIZE;
+          network->hidden_biases[h] += step;
+          total_step_distance += step*step;
+          new_network.hidden_biases[h] = network->hidden_biases[h];
+          
+          double new_err = 0;
+          for (int k = 0; k < BATCH_SIZE; k++)
+            new_err += error(network, train_batch_inputs[k], train_batch_outputs[k]);
+          
+          network->hidden_biases[h] = orig_value;
+          gradient->hidden_biases[h] = sign(gradient->hidden_biases[h]) * (base_err - new_err);
+        }
+
+        // compute gradient for output biases
+        for (int o = 0; o < OUTPUT_SIZE; o++)
+        {
+          double orig_value = network->output_biases[o]; 
+          double step = gradient->output_biases[o] * STEP_SIZE;
+          network->output_biases[o] += step;
+          total_step_distance += step*step;
+          new_network.output_biases[o] = network->output_biases[o];
+
+          double new_err = 0;
+          for (int k = 0; k < BATCH_SIZE; k++)
+            new_err += error(network, train_batch_inputs[k], train_batch_outputs[k]);
+
+          network->output_biases[o] = orig_value;
+          gradient->output_biases[o] = sign(gradient->output_biases[o]) * (base_err - new_err);
+        }
+
+#ifdef MULTITHREADING
+        // compute gradient for input to hidden weights
+        for (int t = 0; t < NTHREADS; t++)
+        {
+          if (!pthread_create(&thread_ids[t], NULL, train_itoh_thread, &thread_data[t]))
+          {
+            printf("Error creating thread! Aborting...\n");
+            return 1;
+        }        
+      }
+      for (int t = 0; t < NTHREADS; t++)
       {
-        double orig_value = network->hidden_biases[h]; 
-        double step = gradient->hidden_biases[h] * STEP_SIZE;
-        network->hidden_biases[h] += step;
-        total_step_distance += step*step;
-        new_network.hidden_biases[h] = network->hidden_biases[h];
-        
-        double new_err = 0;
-        for (int k = 0; k < BATCH_SIZE; k++)
-          new_err += error(network, train_batch_inputs[k], train_batch_outputs[k]);
-        
-        network->hidden_biases[h] = orig_value;
-        gradient->hidden_biases[h] = sign(gradient->hidden_biases[h]) * (base_err - new_err);
+        pthread_join(thread_ids[t], NULL);
+        total_step_distance += thread_data[t].step_distance;
       }
 
-      // compute gradient for output biases
-      for (int o = 0; o < OUTPUT_SIZE; o++)
+      // compute gradient for hidden to output weights
+      for (int t = 0; t < NTHREADS; t++)
       {
-        double orig_value = network->output_biases[o]; 
-        double step = gradient->output_biases[o] * STEP_SIZE;
-        network->output_biases[o] += step;
-        total_step_distance += step*step;
-        new_network.output_biases[o] = network->output_biases[o];
-
-        double new_err = 0;
-        for (int k = 0; k < BATCH_SIZE; k++)
-          new_err += error(network, train_batch_inputs[k], train_batch_outputs[k]);
-
-        network->output_biases[o] = orig_value;
-        gradient->output_biases[o] = sign(gradient->output_biases[o]) * (base_err - new_err);
+        if (!pthread_create(&thread_ids[t], NULL, train_htoo_thread, &thread_data[t]))
+        {
+          printf("Error creating thread! Aborting...\n");
+          return 1;
+        }        
+      }
+      for (int t = 0; t < NTHREADS; t++)
+      {
+        pthread_join(thread_ids[t], NULL);
+        total_step_distance += thread_data[t].step_distance;
       }
 
+#else      
       // compute gradient for input to hidden weights
       for (int i = 0; i < INPUT_SIZE; i++)
       {
@@ -360,6 +485,7 @@ int main(int argc, char** argv)
           gradient->hidden_to_output_weights[h][o] = sign(gradient->hidden_to_output_weights[h][o]) * (base_err - new_err);
         }
       }
+#endif
 
       // apply gradient shift
       *network = new_network;
@@ -369,7 +495,7 @@ int main(int argc, char** argv)
       scale_network(gradient, factor);
 
       printf("Stepped a total distance of %.4f; scaling by a factor of %.4f\n", sqrt(total_step_distance), factor);
-      printf("Error after iteration %d: %.16lf\n", j+1, base_err);
+      printf("Error after iteration %d: %.16lf\n", batch+1, base_err);
       
     }
   }
